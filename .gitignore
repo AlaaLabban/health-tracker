@@ -1,0 +1,9 @@
+# your data and settings
+*.db
+*.db-journal
+bot.env
+tracker.json
+raw/
+summary.html
+summary.pdf
+__pycache__/

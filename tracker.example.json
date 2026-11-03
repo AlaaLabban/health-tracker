@@ -1,0 +1,36 @@
+{
+  "title": "Health log",
+  "symptoms": [
+    {"name": "Headache", "icon": "🤕"},
+    {"name": "Fatigue", "icon": "🥱"},
+    {"name": "Nausea", "icon": "🤢"},
+    {"name": "Dizziness", "icon": "💫"}
+  ],
+  "quick_med": {"name": "Paracetamol", "icon": "💊", "label": "Paracetamol — 500 mg tablets", "mg_per_tablet": 500, "max_tablets": 4},
+  "meds": [
+    {"name": "Paracetamol", "unit": "tablets", "mg_per_unit": 500, "aliases": ["panadol", "tylenol"]},
+    {"name": "Ibuprofen", "unit": "tablets", "mg_per_unit": 400, "aliases": ["advil", "brufen"]}
+  ],
+  "factors": [
+    {"key": "activity", "icon": "🏃", "title": "Activity", "values": [
+      {"value": "Sedentary", "label": "Home", "meaning": "Did not leave home"},
+      {"value": "Low", "label": "Errands", "meaning": "A few errands, or out without much walking"},
+      {"value": "Moderate", "label": "Office", "meaning": "A normal working day"},
+      {"value": "High", "label": "Gym/out", "meaning": "Long day out, or a gym session"},
+      {"value": "Very high", "label": "Sport", "meaning": "A match or a long hard session"}]},
+    {"key": "stress", "icon": "😌", "title": "Stress", "values": [
+      {"value": "None", "label": "No stress"},
+      {"value": "Little", "label": "Little"},
+      {"value": "Moderate", "label": "Moderate"},
+      {"value": "A lot", "label": "A lot"}]},
+    {"key": "sleep_quality", "icon": "😴", "title": "Sleep", "default": "Good", "values": [
+      {"value": "Awful", "label": "Awful", "score": 1},
+      {"value": "Poor", "label": "Poor", "score": 2},
+      {"value": "OK", "label": "OK", "score": 3},
+      {"value": "Good", "label": "Good", "score": 4},
+      {"value": "Great", "label": "Great", "score": 5}]},
+    {"key": "fasted", "icon": "🍽", "title": "Fasted", "none_label": "Not fasted", "values": [
+      {"value": "Intermittent", "label": "Intermittent", "score": 1, "meaning": "No food for about half a day; water and tea allowed"},
+      {"value": "Full day", "label": "Full day", "score": 2, "meaning": "Nothing eaten or drunk from dawn to sunset"}]}
+  ]
+}
