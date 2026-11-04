@@ -1,0 +1,18 @@
+[Unit]
+Description=Health log Telegram bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# Replace @USER@ and @INSTALL_DIR@, then copy to /etc/systemd/system/health-bot.service.
+User=@USER@
+EnvironmentFile=@INSTALL_DIR@/bot.env
+WorkingDirectory=@INSTALL_DIR@
+ExecStart=/usr/bin/python3 -u @INSTALL_DIR@/telegram_bot.py
+Restart=on-failure
+RestartSec=10
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
