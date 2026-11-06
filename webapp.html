@@ -1,0 +1,145 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Health log</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+  /* Telegram passes its theme in as --tg-theme-* variables; the fallbacks are its dark theme. */
+  :root {
+    --bg: var(--tg-theme-bg-color, #17212b);
+    --card: var(--tg-theme-secondary-bg-color, #232e3c);
+    --text: var(--tg-theme-text-color, #f5f5f5);
+    --hint: var(--tg-theme-hint-color, #8b98a5);
+    --chip: var(--tg-theme-section-bg-color, #2b3848);
+    --green: #3e9b53;
+    --green-text: #ffffff;
+  }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font: 15px/1.35 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+  main { padding: 12px 12px 96px; max-width: 520px; margin: 0 auto; }
+  h1 { font-size: 19px; margin: 4px 2px 12px; }
+  .label { margin: 14px 2px 6px; font-weight: 600; font-size: 14px; color: var(--hint); }
+  .row { display: grid; gap: 6px; grid-auto-flow: column; grid-auto-columns: 1fr; }
+  button.opt { border: 0; border-radius: 10px; padding: 11px 4px; background: var(--chip); color: var(--text);
+               font: inherit; font-size: 14px; font-weight: 500; white-space: nowrap; overflow: hidden;
+               text-overflow: ellipsis; transition: background .08s; }
+  button.opt.on { background: var(--green); color: var(--green-text); }
+  .top button.opt { padding: 14px 4px; font-size: 15px; }
+  #symptoms { overflow: hidden; display: none; background: var(--card); border-radius: 14px; padding: 2px 10px 12px; margin-top: 8px; }
+  #symptoms.open { display: block; }
+  #save { position: fixed; left: 12px; right: 12px; bottom: 14px; max-width: 496px; margin: 0 auto;
+          border: 0; border-radius: 14px; padding: 16px; font: inherit; font-size: 17px; font-weight: 600;
+          background: var(--green); color: #fff; }
+  #save:disabled { opacity: .6; }
+  #status { text-align: center; color: var(--hint); margin-top: 14px; min-height: 20px; }
+</style>
+</head>
+<body>
+<main>
+  <h1 id="title">Loading…</h1>
+  <div class="row top">
+    <button class="opt" id="normal">👌 Normal day</button>
+    <button class="opt" id="symbtn">🤒 Symptoms</button>
+  </div>
+  <div id="symptoms"></div>
+  <div id="rows"></div>
+  <div id="status"></div>
+</main>
+<button id="save" disabled>💾 Save</button>
+<script>
+const tg = window.Telegram && window.Telegram.WebApp;
+if (tg) { tg.ready(); tg.expand(); }
+const params = new URLSearchParams(location.search);
+let S = null;        // { date, title, symptoms:{name:0-3|null}, tablets:int, quick:{icon,label,max}, factors:{key:value}, ... }
+
+const el = (tag, cls, text) => { const e = document.createElement(tag); if (cls) e.className = cls; if (text) e.textContent = text; return e; };
+const buzz = () => tg && tg.HapticFeedback && tg.HapticFeedback.selectionChanged();
+
+function row(labelText, options, isOn, onTap) {
+  const frag = document.createDocumentFragment();
+  frag.appendChild(el("div", "label", labelText));
+  const r = el("div", "row");
+  options.forEach((opt, i) => {
+    const b = el("button", "opt" + (isOn(i) ? " on" : ""), opt);
+    b.onclick = () => { onTap(i); buzz(); render(); };
+    r.appendChild(b);
+  });
+  frag.appendChild(r);
+  return frag;
+}
+
+function render() {
+  const sym = S.symptoms, names = Object.keys(sym);
+  const logged = names.some(n => sym[n] !== null);
+  const any = names.some(n => sym[n] > 0);
+  document.getElementById("title").textContent = S.title;
+  document.getElementById("normal").classList.toggle("on", logged && !any);
+  document.getElementById("symbtn").classList.toggle("on", any);
+
+  const box = document.getElementById("symptoms");
+  box.replaceChildren();
+  S.symptom_list.forEach(([name, icon]) => {
+    box.appendChild(row(`${icon} ${name}`, ["None", "Mild", "Moderate", "Severe"],
+      i => (sym[name] ?? 0) === i,
+      i => { names.forEach(n => { if (sym[n] === null) sym[n] = 0; }); sym[name] = i; }));
+  });
+
+  const rows = document.getElementById("rows");
+  rows.replaceChildren();
+  const counts = Array.from({ length: S.quick.max }, (_, i) => String(i + 1));
+  rows.appendChild(row(`${S.quick.icon} ${S.quick.label} (tap again to clear)`, counts,
+    i => S.tablets === i + 1, i => { S.tablets = S.tablets === i + 1 ? 0 : i + 1; }));
+  S.factor_list.forEach(f => {
+    rows.appendChild(row(`${f.icon} ${f.title}`, f.labels,
+      i => S.factors[f.key] === f.options[i], i => { S.factors[f.key] = f.options[i]; }));
+  });
+  document.getElementById("save").disabled = false;
+}
+
+document.getElementById("normal").onclick = () => {
+  Object.keys(S.symptoms).forEach(n => S.symptoms[n] = 0);
+  document.getElementById("symptoms").classList.remove("open");
+  buzz(); render();
+};
+document.getElementById("symbtn").onclick = () => {
+  document.getElementById("symptoms").classList.toggle("open");
+  buzz();
+};
+
+async function api(path, body) {
+  const res = await fetch(path, { method: body ? "POST" : "GET",
+    headers: { "Content-Type": "application/json", "X-Init-Data": tg ? tg.initData : "" },
+    body: body ? JSON.stringify(body) : undefined });
+  if (!res.ok) throw new Error((await res.text()) || res.status);
+  return res.json();
+}
+
+document.getElementById("save").onclick = async () => {
+  const btn = document.getElementById("save");
+  const status = document.getElementById("status");
+  if (!Object.values(S.symptoms).some(v => v !== null)) {
+    status.textContent = "Pick 👌 Normal day or set your symptoms first.";
+    tg && tg.HapticFeedback && tg.HapticFeedback.notificationOccurred("warning");
+    return;
+  }
+  btn.disabled = true; btn.textContent = "Saving…";
+  try {
+    await api("/api/save", { date: S.date, symptoms: S.symptoms, tablets: S.tablets, factors: S.factors });
+    btn.textContent = "✅ Saved";
+    tg && tg.HapticFeedback && tg.HapticFeedback.notificationOccurred("success");
+    setTimeout(() => tg ? tg.close() : null, 600);
+  } catch (e) {
+    btn.disabled = false; btn.textContent = "💾 Save";
+    status.textContent = "Couldn't save: " + e.message;
+  }
+};
+
+api("/api/day" + (params.get("d") ? "?d=" + encodeURIComponent(params.get("d")) : ""))
+  .then(data => { S = data; if (Object.values(S.symptoms).some(v => v > 0)) document.getElementById("symptoms").classList.add("open"); render(); })
+  .catch(e => { document.getElementById("title").textContent = "Couldn't load: " + e.message; });
+</script>
+</body>
+</html>

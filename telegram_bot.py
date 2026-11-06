@@ -27,7 +27,10 @@ Config comes from the environment (see bot.env.example). The Claude call
 runs under its own CLAUDE_CONFIG_DIR and refuses any account but
 ALLOWED_EMAIL; ANTHROPIC_* variables are scrubbed so it never bills the API.
 """
+import hashlib
+import hmac
 import http.client
+import http.server
 import json
 import os
 import re
@@ -56,6 +59,10 @@ CLAUDE_CONFIG_DIR = os.environ.get("CLAUDE_CONFIG_DIR", "")
 ALLOWED_EMAIL = os.environ.get("ALLOWED_EMAIL", "").lower()
 MODEL = os.environ.get("CLAUDE_MODEL", "sonnet")
 DAILY_CAP = int(os.environ.get("DAILY_CAP", "40"))
+# Mini App: the page and its API are served by this process on WEBAPP_BIND:WEBAPP_PORT, published by Traefik at WEBAPP_URL
+WEBAPP_URL = os.environ.get("WEBAPP_URL", "")
+WEBAPP_BIND = os.environ.get("WEBAPP_BIND", "127.0.0.1")
+WEBAPP_PORT = int(os.environ.get("WEBAPP_PORT", "8097"))
 TIMING = os.environ.get("TIMING") == "1"     # log each Telegram call's round trip
 CALL_TIMEOUT = 120
 LOCAL_TZ = timezone(timedelta(hours=int(os.environ.get("UTC_OFFSET_HOURS", "3"))))
@@ -331,7 +338,8 @@ def card(con, day, view="main", lead=None):
         lines.append(f"☕ <b>{sum(d['mg'] for d in drinks):.0f} mg</b> — " + ", ".join(esc(d["said"]) for d in drinks))
     for n in notes:
         lines.append(f"📝 {esc(n)}")
-    rows = [[green("👌 Normal day", f"v|{day}|nd|0", logged and not any(sym.values())),
+    rows = [[{"text": "⚡ Quick log (instant taps)", "web_app": {"url": f"{WEBAPP_URL}?d={day}"}}]] if WEBAPP_URL else []
+    rows += [[green("👌 Normal day", f"v|{day}|nd|0", logged and not any(sym.values())),
              green("🤒 Symptoms", f"c|{day}|sym", logged and any(sym.values()))],
             label(f"{QUICK['icon']} {QUICK['label']} (tap again to clear)"),
             [green(str(n), f"v|{day}|med|{0 if tabs == n else n}", tabs == n) for n in range(1, QUICK["max_tablets"] + 1)]]
@@ -648,6 +656,136 @@ def show_day(con, day):
     send_card(con, day)
 
 
+# ---------------------------------------------------------------- Mini App
+# A page inside Telegram (webapp.html) where taps change colour on the phone at once and one Save sends
+# the whole day. Every API call carries Telegram's signed initData, checked against the bot token, and
+# only the owner's own user id (CHAT_ID) is accepted.
+
+REDRAWS = queue.Queue()
+
+
+def redraw_worker():
+    """Redraw every card sent for a day after a Mini App save, on its own thread and connection."""
+    while True:
+        day = REDRAWS.get()
+        con = db()
+        try:
+            for msg_id in json.loads(state_get(con, f"cards:{day}") or "[]"):
+                try:
+                    edit(msg_id, *card(con, day))
+                except Exception as exc:            # deleted or too old to edit
+                    log(f"card {msg_id} not redrawn: {exc}")
+        finally:
+            con.close()
+
+
+def init_data_ok(raw):
+    """Telegram's Mini App check: HMAC-SHA256 of the sorted fields, keyed by HMAC("WebAppData", bot token)."""
+    fields = dict(urllib.parse.parse_qsl(raw or "", keep_blank_values=True))
+    sent = fields.pop("hash", "")
+    check = "\n".join(f"{k}={v}" for k, v in sorted(fields.items()))
+    secret = hmac.new(b"WebAppData", TOKEN.encode(), hashlib.sha256).digest()
+    if not sent or not hmac.compare_digest(hmac.new(secret, check.encode(), hashlib.sha256).hexdigest(), sent):
+        return False
+    try:
+        user = json.loads(fields.get("user", "{}"))
+        fresh = time.time() - int(fields.get("auth_date", 0)) < 24 * 3600
+    except ValueError:
+        return False
+    return user.get("id") == CHAT_ID and fresh
+
+
+def day_payload(con, day):
+    sym, tabs, fac, _, _ = day_state(con, day)
+    return {"date": day, "title": f"📋 {pretty(day)}",
+            "symptoms": sym, "tablets": tabs,
+            "quick": {"icon": QUICK["icon"], "label": QUICK["label"], "max": QUICK["max_tablets"]},
+            "factors": {f: factor_value(con, fac, f) for f, *_ in FACTORS},
+            "symptom_list": SYMPTOMS,
+            "factor_list": [{"key": f, "icon": icon, "title": title, "labels": labels, "options": options(con, f)}
+                            for f, icon, title, labels in FACTORS]}
+
+
+def save_day(con, body):
+    day = body["date"]
+    datetime.strptime(day, "%Y-%m-%d")
+    sym, tabs, factors = body["symptoms"], int(body["tablets"]), body["factors"]
+    if set(sym) != {name for name, _ in SYMPTOMS} or any(v not in (0, 1, 2, 3) for v in sym.values()):
+        raise ValueError("bad symptoms")
+    if tabs not in range(QUICK["max_tablets"] + 1) or set(factors) != {f for f, *_ in FACTORS}:
+        raise ValueError("bad tablets or factors")
+    ensure_symptoms(con, day)
+    for name, v in sym.items():
+        con.execute("UPDATE symptoms SET severity = ? WHERE date = ? AND source = 'telegram' AND symptom = ?", (v, day, name))
+    set_value(con, day, "med", tabs)
+    for k, (factor, *_) in enumerate(FACTORS):
+        if factors[factor] not in options(con, factor):
+            raise ValueError(f"bad {factor}")
+        set_value(con, day, f"f{k}", options(con, factor).index(factors[factor]))
+    con.commit()
+
+
+class WebApp(http.server.BaseHTTPRequestHandler):
+    def reply(self, code, body, ctype="application/json"):
+        data = body if isinstance(body, bytes) else json.dumps(body).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def authorised(self):
+        if init_data_ok(self.headers.get("X-Init-Data")):
+            return True
+        self.reply(403, b"Open this from the bot in Telegram.", "text/plain")
+        return False
+
+    def do_GET(self):
+        url = urllib.parse.urlparse(self.path)
+        if url.path in ("/", "/index.html"):
+            self.reply(200, (HERE / "webapp.html").read_bytes(), "text/html; charset=utf-8")
+        elif url.path == "/api/day" and self.authorised():
+            day = urllib.parse.parse_qs(url.query).get("d", [log_day()])[0]
+            con = db()
+            try:
+                datetime.strptime(day, "%Y-%m-%d")
+                self.reply(200, day_payload(con, day))
+            except ValueError:
+                self.reply(400, b"Bad date.", "text/plain")
+            finally:
+                con.close()
+        elif url.path not in ("/api/day",):
+            self.reply(404, b"Not found.", "text/plain")
+
+    def do_POST(self):
+        if self.path != "/api/save" or not self.authorised():
+            if self.path != "/api/save":
+                self.reply(404, b"Not found.", "text/plain")
+            return
+        con = db()
+        try:
+            body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0)) or 0))
+            save_day(con, body)
+            self.reply(200, {"ok": True})
+            REDRAWS.put(body["date"])
+            log(f"webapp save {body['date']}: ok")
+        except (ValueError, KeyError, TypeError) as exc:
+            con.rollback()
+            self.reply(400, f"Not saved: {exc}".encode(), "text/plain")
+        finally:
+            con.close()
+
+    def log_message(self, fmt, *args):
+        pass                                 # requests are not logged; saves are, above
+
+
+def serve_webapp():
+    server = http.server.ThreadingHTTPServer((WEBAPP_BIND, WEBAPP_PORT), WebApp)
+    log(f"webapp on http://{WEBAPP_BIND}:{WEBAPP_PORT} -> {WEBAPP_URL or '(no public URL set)'}")
+    server.serve_forever()
+
+
 # ---------------------------------------------------------------- schedule
 
 def due(con, key, at, now):
@@ -677,6 +815,8 @@ def main():
         sys.exit("TELEGRAM_TOKEN is not set")
     init_db()
     threading.Thread(target=ack_worker, daemon=True).start()
+    threading.Thread(target=redraw_worker, daemon=True).start()
+    threading.Thread(target=serve_webapp, daemon=True).start()
     con = db()
     offset = int(state_get(con, "offset") or 0)
     log(f"health bot up: chat={CHAT_ID or 'unset'} ask={ASK_AT} chase={CHASE_AT} model={MODEL}")
