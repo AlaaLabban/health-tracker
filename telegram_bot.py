@@ -6,9 +6,12 @@ One card a day, edited in place, instead of a long daily form:
   🤒 Symptoms     – a tap grid, None/Mild/Moderate/Severe per symptom
   then the one-tap medicine (tablets) and a row per daily factor.
 What the card asks comes from tracker.json (see tracker.py).
-The card goes out at ASK_AT; if the day still has no symptom rows the next
-morning, it is sent again at CHASE_AT. Buttons carry their date, so a late
-tap still lands on the right day.
+Escalation for an unlogged day (a day is logged once it has symptom rows):
+ASK_AT the day card goes out, REMIND_AT a fresh card is sent if it is still
+empty, and, if ASTERISK_SPOOL is set, CALL_AT the next day Asterisk rings every
+phone together (the first to answer stops the others) and plays a "yesterday
+is not logged" message, while the card is sent again. Buttons carry their
+date, so a late tap still lands on the right day.
 
 Anything typed in free text ("tiny cola zero", "matcha I used 5g", "headache
 now, took 2 paracetamol") is turned into rows by `claude -p` with no tools. The
@@ -52,8 +55,13 @@ HERE = Path(__file__).parent
 TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 CHAT_ID = int(os.environ.get("CHAT_ID") or 0)
 DB_PATH = os.environ.get("DB_PATH", str(HERE / "health.db"))
-ASK_AT = os.environ.get("ASK_AT", "22:00")
-CHASE_AT = os.environ.get("CHASE_AT", "10:00")          # the next morning
+ASK_AT = os.environ.get("ASK_AT", "20:00")
+REMIND_AT = os.environ.get("REMIND_AT", "22:00")
+CALL_AT = os.environ.get("CALL_AT", "15:00")            # the next day
+# Optional phone reminder: the spool folder of an Asterisk (for example phone-ai-gateway's spool/). A call
+# file renamed into outgoing/ makes Asterisk dial; its [tracker-ring] context rings every phone at once.
+# Empty = no calls, only the Telegram reminders.
+ASTERISK_SPOOL = Path(os.environ["ASTERISK_SPOOL"]) if os.environ.get("ASTERISK_SPOOL") else None
 DAY_STARTS_AT = 4                       # hour; earlier than this still counts as the previous day
 CLAUDE_CONFIG_DIR = os.environ.get("CLAUDE_CONFIG_DIR", "")
 ALLOWED_EMAIL = os.environ.get("ALLOWED_EMAIL", "").lower()
@@ -799,15 +807,51 @@ def due(con, key, at, now):
     return True
 
 
+def call_file(day):
+    return ASTERISK_SPOOL / "outgoing" / f"tracker-{day}.call"
+
+
+def queue_call(day):
+    """Ring every phone at once; the first to answer hears the message. Unanswered, Asterisk retries
+    twice, 15 min apart. cancel_calls() deletes the file once the day is logged, which stops any retry
+    still pending. The [tracker-ring] and [tracker-missed] dialplan contexts are in docs/PHONE.md."""
+    body = ("Channel: Local/s@tracker-ring\n"
+            'CallerID: "Health log" <100>\n'
+            "WaitTime: 60\nMaxRetries: 2\nRetryTime: 900\n"
+            "Context: tracker-missed\nExtension: s\nPriority: 1\n")
+    tmp = ASTERISK_SPOOL / "callfiles-tmp" / f"tracker-{day}.call"
+    tmp.write_text(body)
+    tmp.rename(call_file(day))          # atomic: Asterisk never reads a half-written file
+    log(f"call queued: {day} not logged")
+
+
+def cancel_calls(con):
+    if ASTERISK_SPOOL is None:
+        return
+    for f in (ASTERISK_SPOOL / "outgoing").glob("tracker-*.call"):
+        day = f.stem.removeprefix("tracker-")
+        if is_logged(con, day):
+            f.unlink(missing_ok=True)
+            log(f"call cancelled: {day} is logged")
+
+
 def tick(con):
     now = datetime.now(LOCAL_TZ)
     day = log_day(now)
     if due(con, "asked", ASK_AT, now) and not is_logged(con, day):
         send_card(con, day, lead=f"How was {pretty(day)}?")
-    if due(con, "chased", CHASE_AT, now):
+    if due(con, "reminded", REMIND_AT, now) and not is_logged(con, day):
+        send_card(con, day, lead=f"⏰ Reminder: {pretty(day)} isn't logged yet")
+    if due(con, "called", CALL_AT, now):
         yesterday = (now.date() - timedelta(days=1)).isoformat()
         if not is_logged(con, yesterday):
-            send_card(con, yesterday, lead=f"⏰ Still missing: {pretty(yesterday)}")
+            if ASTERISK_SPOOL is not None:
+                try:
+                    queue_call(yesterday)
+                except OSError as exc:
+                    log(f"call not queued: {exc}")
+            send_card(con, yesterday, lead=f"📞 Still missing: {pretty(yesterday)}")
+    cancel_calls(con)
 
 
 def main():
@@ -819,7 +863,7 @@ def main():
     threading.Thread(target=serve_webapp, daemon=True).start()
     con = db()
     offset = int(state_get(con, "offset") or 0)
-    log(f"health bot up: chat={CHAT_ID or 'unset'} ask={ASK_AT} chase={CHASE_AT} model={MODEL}")
+    log(f"health bot up: chat={CHAT_ID or 'unset'} ask={ASK_AT} remind={REMIND_AT} call={CALL_AT} model={MODEL}")
     while True:
         try:
             if CHAT_ID:
